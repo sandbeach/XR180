@@ -15,5 +15,6 @@ sdk=$(xcrun --sdk macosx --show-sdk-path)
 arch=$(uname -m)
 "$compiler" -O -sdk "$sdk" -target "$arch-apple-macosx13.0" \
   -module-cache-path "$PWD/build/modules" Sources/*.swift -o "$app/Contents/MacOS/XR180"
+bash stage-ffmpeg.sh "$app"
 codesign --force --sign - "$app"
 echo "$app"

@@ -6,8 +6,10 @@ mkdir -p "$validation/Contents/MacOS" "$validation/Contents/Resources" "$PWD/bui
 cp Info.plist "$validation/Contents/Info.plist"
 cp Sources/Projection.metal "$validation/Contents/Resources/"
 xcrun swiftc -O -module-cache-path "$PWD/build/modules" \
-  Sources/Tracking.swift Sources/Renderer.swift Sources/Playback.swift Sources/RemoteSource.swift Sources/SMBKeychain.swift Validation/main.swift \
+  Sources/Tracking.swift Sources/Renderer.swift Sources/Playback.swift Sources/Compatibility.swift \
+  Sources/RemoteSource.swift Sources/SMBKeychain.swift Validation/main.swift \
   -o "$validation/Contents/MacOS/XR180"
+bash stage-ffmpeg.sh "$validation"
 fixture=$(mktemp -d "$PWD/build/fixture.XXXXXX")
 trap 'rmdir "$fixture" 2>/dev/null || true' EXIT
 "$validation/Contents/MacOS/XR180" "$fixture/stereo.mp4"

@@ -9,6 +9,7 @@ final class Playback: ObservableObject {
     @Published var title = "双眼测试图"
     @Published var error: String?
     @Published var loading = false
+    @Published private(set) var preparingCompatibility = false
     @Published var playing = false
     @Published var buffering = false
     @Published var hasVideo = false
@@ -33,6 +34,7 @@ final class Playback: ObservableObject {
     private var outputDisplayID: CGDirectDisplayID?
     weak var controlsWindow: NSWindow?
     private var pendingLoad: Task<Void, Never>?
+    private var compatibleMovie: CompatibleMovie?
     private var loadID = UUID()
     private var tick: Timer?
     private var seekID = UUID()
@@ -41,7 +43,7 @@ final class Playback: ObservableObject {
     init(renderer: Renderer) {
         self.renderer = renderer
         renderer.didFailFrame = { [weak self] in
-            self?.error = "无法把解码后的画面交给 Metal。请试用较低分辨率的 H.264 或 HEVC MP4。"
+            self?.error = "无法把解码后的画面交给 Metal。请试用相同片源的较低分辨率版本。"
         }
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.15, preferredTimescale: 600), queue: .main
@@ -76,7 +78,8 @@ final class Playback: ObservableObject {
 
     func openFile(in folder: URL? = nil) {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+        let additionalExtensions = ["mkv", "webm", "avi", "mts", "m2ts", "ts", "mpg", "mpeg", "flv", "wmv", "ogv"]
+        panel.allowedContentTypes = [.movie] + additionalExtensions.compactMap { UTType(filenameExtension: $0) }
         panel.directoryURL = folder
         if folder != nil { panel.message = "在共享文件夹中选择要播放的视频。" }
         panel.canChooseDirectories = false
@@ -92,27 +95,70 @@ final class Playback: ObservableObject {
         pendingLoad = Task { @MainActor [weak self] in
             do {
                 let asset = AVURLAsset(url: url)
-                let video = try await asset.loadTracks(withMediaType: .video)
-                let playable = try await asset.load(.isPlayable)
-                let duration = try await asset.load(.duration).seconds
+                let duration = try await Self.playableDuration(asset)
                 guard let self, self.loadID == request else { return }
-                guard playable, !video.isEmpty, duration.isFinite, duration > 0 else {
-                    self.mediaError(url.isFileURL
-                        ? "此文件没有可播放的视频轨道。请试用 H.264 或 HEVC 编码的 MP4 / MOV。"
-                        : "链接未返回可播放的视频。请确认它是可直接读取的 MP4 / MOV 文档地址。")
-                    return
-                }
-                self.prepare(asset, duration: duration)
+                self.prepare(asset, duration: duration, fallbackInput: url.isFileURL ? url : nil)
             } catch {
                 guard let self, self.loadID == request else { return }
-                self.mediaError(url.isFileURL
-                    ? "无法打开视频。\(error.localizedDescription)"
-                    : "无法打开网络视频。请确认链接可访问、未过期，并指向视频文件。")
+                if url.isFileURL { self.startCompatibility(url, request: request) }
+                else { self.mediaError("无法打开网络视频。请确认链接可访问、未过期，并指向可直接播放的视频文件。") }
             }
         }
     }
 
-    private func prepare(_ asset: AVURLAsset, duration: Double) {
+    private static func playableDuration(_ asset: AVURLAsset) async throws -> Double {
+        guard try await asset.load(.isPlayable),
+              let video = try await asset.loadTracks(withMediaType: .video).first,
+              try await video.load(.isDecodable) else { throw Compatibility.Failure.noVideo }
+        if let audio = try await asset.loadTracks(withMediaType: .audio).first,
+           try await !audio.load(.isDecodable) { throw Compatibility.Failure.cannotConvert }
+        let duration = try await asset.load(.duration).seconds
+        guard duration.isFinite, duration > 0 else { throw Compatibility.Failure.noVideo }
+        return duration
+    }
+
+    private func startCompatibility(_ input: URL, request: UUID, allowVideoCopy: Bool = true) {
+        detachMedia()
+        compatibleMovie = nil
+        seekID = UUID()
+        seeking = false
+        elapsed = 0
+        duration = 0
+        hasVideo = false
+        buffering = false
+        loading = true
+        preparingCompatibility = true
+        pendingLoad = Task { @MainActor [weak self] in
+            do {
+                let (movie, asset, duration) = try await Self.compatibleAsset(input, allowVideoCopy: allowVideoCopy)
+                guard let self, self.loadID == request else { return }
+                self.compatibleMovie = movie
+                self.prepare(asset, duration: duration, fallbackInput: movie.copiedVideo ? input : nil)
+            } catch {
+                guard let self, self.loadID == request else { return }
+                self.mediaError(error.localizedDescription)
+            }
+        }
+    }
+
+    private static func compatibleAsset(_ input: URL, allowVideoCopy: Bool) async throws
+        -> (CompatibleMovie, AVURLAsset, Double) {
+        let movie = try await Compatibility.prepareCopy(of: input, allowVideoCopy: allowVideoCopy)
+        let asset = AVURLAsset(url: movie.url)
+        do {
+            return (movie, asset, try await Self.playableDuration(asset))
+        } catch where movie.copiedVideo {
+            try Task.checkCancellation()
+            return try await compatibleAsset(input, allowVideoCopy: false)
+        }
+    }
+
+    func cancelCompatibility() {
+        guard preparingCompatibility else { return }
+        showTestPattern()
+    }
+
+    private func prepare(_ asset: AVURLAsset, duration: Double, fallbackInput: URL?) {
         let item = AVPlayerItem(asset: asset)
         let isNetworkURL = !asset.url.isFileURL
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
@@ -129,9 +175,15 @@ final class Playback: ObservableObject {
                 switch item.status {
                 case .readyToPlay:
                     self.loading = false
+                    self.preparingCompatibility = false
                     self.hasVideo = true
                     self.startPlayback()
                 case .failed:
+                    if let fallbackInput {
+                        self.startCompatibility(fallbackInput, request: self.loadID,
+                                                allowVideoCopy: self.compatibleMovie == nil)
+                        return
+                    }
                     self.mediaError(isNetworkURL
                         ? "网络视频播放失败。请检查连接、链接有效期和视频编码。"
                         : "解码失败。\(item.error?.localizedDescription ?? "此编码可能不受 macOS 支持。")")
@@ -171,19 +223,25 @@ final class Playback: ObservableObject {
         loadID = UUID()
         seeking = false
         seekID = UUID()
-        player.pause()
-        player.replaceCurrentItem(with: nil)
-        renderer.output = nil
-        itemObservation = nil
-        itemObservers.forEach { NotificationCenter.default.removeObserver($0) }
-        itemObservers.removeAll()
+        detachMedia()
+        compatibleMovie = nil
         elapsed = 0
         duration = 0
         error = nil
         loading = false
+        preparingCompatibility = false
         hasVideo = false
         playing = false
         buffering = false
+    }
+
+    private func detachMedia() {
+        itemObservation = nil
+        itemObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        itemObservers.removeAll()
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        renderer.output = nil
     }
 
     func togglePlayback() {

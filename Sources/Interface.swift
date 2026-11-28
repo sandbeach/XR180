@@ -120,8 +120,15 @@ struct PlayerInterface: View {
                     Preview(player: player).aspectRatio(16 / 9, contentMode: .fit)
                 }
                 if player.loading || player.buffering {
-                    ProgressView(player.loading ? "正在打开…" : "正在缓冲…").padding(14)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                    VStack(spacing: 8) {
+                        ProgressView(player.preparingCompatibility ? "正在准备兼容播放…" :
+                                     player.loading ? "正在打开…" : "正在缓冲…")
+                        if player.preparingCompatibility {
+                            Button("取消") { player.cancelCompatibility() }
+                        }
+                    }
+                    .padding(14)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
                 }
             }
             .frame(maxWidth: .infinity)

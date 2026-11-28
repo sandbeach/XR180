@@ -82,7 +82,16 @@ func encodeFixture(_ url: URL) throws {
     require(done.wait(timeout: .now() + 8) == .success && writer.status == .completed, "finish fixture")
 }
 
-func checkRendering(_ url: URL) throws {
+func runFFmpeg(_ arguments: [String]) throws {
+    let command = Process()
+    command.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ffmpeg")
+    command.arguments = ["-nostdin", "-v", "error", "-y"] + arguments
+    try command.run()
+    command.waitUntilExit()
+    require(command.terminationStatus == 0, "create synthetic compatibility fixture")
+}
+
+func checkRendering(_ url: URL, compatible: Bool = false) throws {
     let renderer = try Renderer()
     let playback = Playback(renderer: renderer)
     playback.open(url)
@@ -90,7 +99,15 @@ func checkRendering(_ url: URL) throws {
     while !playback.hasVideo && playback.error == nil && Date() < deadline {
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.02))
     }
-    require(playback.hasVideo, "AVFoundation prepares native MP4: \(playback.error ?? "timed out")")
+    require(playback.hasVideo, "\(url.lastPathComponent) prepares: \(playback.error ?? "timed out")")
+    let playingURL = (playback.player.currentItem?.asset as? AVURLAsset)?.url
+    require((playingURL?.standardizedFileURL != url.standardizedFileURL) == compatible,
+            "\(url.lastPathComponent) selects the expected playback path")
+    if compatible {
+        require(playingURL?.lastPathComponent == "playback.mp4", "uses a temporary compatibility file")
+        require(playback.player.currentItem?.tracks.contains { $0.assetTrack?.mediaType == .audio } == true,
+                "compatibility file includes an audio track")
+    }
     guard let output = renderer.output else { fatalError("Missing video output") }
     var pixel: CVPixelBuffer?
     let frameDeadline = Date(timeIntervalSinceNow: 5)
@@ -144,7 +161,11 @@ func checkRendering(_ url: URL) throws {
     require(behind.left[0] == 0 && behind.left[2] == 0 &&
             behind.right[0] == 0 && behind.right[2] == 0, "outside the VR180 hemisphere is black")
     withExtendedLifetime(image) {}
-    print("PASS: AVPlayer decoding, Metal projection, separate stereo eyes, swap, behind-camera clipping")
+    playback.showTestPattern()
+    if compatible, let playingURL {
+        require(!FileManager.default.fileExists(atPath: playingURL.path), "temporary movie is removed")
+    }
+    print("PASS: \(url.lastPathComponent) through AVPlayer and Metal with correct left and right eyes")
 }
 
 func checkRemoteAddresses() throws {
@@ -171,6 +192,22 @@ catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 if CommandLine.arguments.count > 1 {
     let fixture = URL(fileURLWithPath: CommandLine.arguments[1])
     defer { try? FileManager.default.removeItem(at: fixture) }
-    do { try encodeFixture(fixture); try checkRendering(fixture) }
+    do {
+        try encodeFixture(fixture)
+        try checkRendering(fixture)
+        for (name, video, audio, options) in [
+            ("h264.mkv", "copy", "pcm_s16le", []),
+            ("vp9.webm", "libvpx-vp9", "libopus", []),
+            ("av1-10bit.mkv", "libaom-av1", "libopus", ["-pix_fmt", "yuv420p10le", "-cpu-used", "8"]),
+            ("ffv1.avi", "ffv1", "pcm_s16le", [])
+        ] {
+            let sample = fixture.deletingLastPathComponent().appendingPathComponent(name)
+            defer { try? FileManager.default.removeItem(at: sample) }
+            try runFFmpeg(["-i", fixture.path, "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                          "-map", "0:v:0", "-map", "1:a:0", "-c:v", video, "-c:a", audio]
+                          + options + ["-t", "0.5", sample.path])
+            try checkRendering(sample, compatible: true)
+        }
+    }
     catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
